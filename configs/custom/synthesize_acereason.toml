@@ -1,0 +1,30 @@
+# Configuration for generating synthetic data with Qwen/Qwen3-4B on primeintellect/acereason-math
+
+# Output directory
+output_dir = "outputs/synthetic_data_qwen"
+
+# Number of examples to generate (set to None to run on the full dataset)
+num_examples = 100 
+rollouts_per_example = 8
+
+# Environment Configuration
+[[env]]
+id = "primeintellect/acereason-math"
+
+# Client Configuration (Local vLLM)
+[client]
+base_url = ["http://localhost:8000/v1"]
+api_key_var = "EMPTY" 
+
+# Model Configuration
+[model]
+name = "Qwen/Qwen3-4B" 
+
+# Sampling Configuration
+[sampling]
+temperature = 0.7
+top_p = 0.9
+max_tokens = 4096
+
+# If the model produces a separate reasoning field (like DeepSeek R1), uncomment this:
+# reasoning_field = "reasoning_content"
