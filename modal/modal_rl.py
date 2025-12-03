@@ -34,16 +34,33 @@ VOLUME_PATH = "/data"
 def build_image():
     """
     Build the Modal container image with all PRIME-RL dependencies.
+
+    Layer ordering is optimized for caching:
+    1. Base image (rarely changes)
+    2. System packages via apt_install (rarely changes)
+    3. uv installation (rarely changes)
+    4. prime CLI installation (rarely changes)
+    5. Python dependencies via uv sync (only rebuilds when pyproject.toml/uv.lock change)
+    6. Prime environments installation (rarely changes)
+    7. Environment variables (must be before runtime mounts)
+    8-12. Configs, source, tests, examples (mounted at RUNTIME - instant deploys!)
+
+    Key optimizations:
+    - Copy only pyproject.toml, uv.lock, README.md before uv sync
+    - Use --no-install-project: source code isn't available at build time (mounted at runtime)
+    - All project files use copy=False: mounted at container startup, not built into image
+    - Result: code/config changes deploy instantly, no image rebuild needed
+
+    IMPORTANT: Runtime mounts (copy=False) must be LAST - no build steps can follow them.
     """
     return (
-        # Use PyTorch CUDA base image
+        # Layer 1: Base image (rarely changes)
         modal.Image.from_registry(
             "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel",
             add_python="3.12"
         )
-        # Set locale
+        # Layer 2: System dependencies (rarely changes)
         .run_commands("echo 'LC_ALL=en_US.UTF-8' >> /etc/environment")
-        # Install system dependencies
         .apt_install(
             "build-essential",
             "curl",
@@ -51,25 +68,24 @@ def build_image():
             "git",
             "git-lfs",
         )
-        # Install uv
+        # Layer 3: Install uv (rarely changes)
         .run_commands(
             "curl -LsSf https://astral.sh/uv/install.sh > /uv-installer.sh",
             "INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR='/usr/local/bin' sh /uv-installer.sh",
             "rm /uv-installer.sh"
         )
-        # Install prime CLI for environment management
-        .run_commands(
-            "uv tool install prime",
-        )
-        # Set working directory and copy repository
+        # Layer 4: Install prime CLI (rarely changes)
+        .run_commands("uv tool install prime")
+        # Add prime CLI to PATH for subsequent build steps
+        .env({"PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
         .workdir("/app")
-        .add_local_dir(
-            ".",
-            remote_path="/app",
-            copy=True,
-            ignore=[".venv/", "__pycache__/", "*.pyc", ".modal/"]
-        )
-        # Install dependencies
+        # Layer 5: Install Python dependencies (only rebuilds when lockfiles change)
+        # We copy only pyproject.toml, uv.lock, and README.md first, then run uv sync.
+        # README.md is required because pyproject.toml references it and hatchling validates it.
+        # This ensures code changes don't invalidate the dependency cache.
+        .add_local_file("pyproject.toml", remote_path="/app/pyproject.toml", copy=True)
+        .add_local_file("uv.lock", remote_path="/app/uv.lock", copy=True)
+        .add_local_file("README.md", remote_path="/app/README.md", copy=True)
         .env({
             "UV_COMPILE_BYTECODE": "1",
             "UV_LINK_MODE": "copy",
@@ -77,18 +93,42 @@ def build_image():
             "PATH": "$PATH:/usr/local/cuda/bin",
         })
         .run_commands(
-            "uv sync --no-dev",
+            "uv sync --no-dev --frozen --no-install-project",
             gpu="any"  # Some packages (flash-attn, vllm) require GPU during build
         )
-        # Install environments from Prime Intellect hub
-        .run_commands(
-            "/root/.local/bin/prime env install primeintellect/single-turn-math --with uv",
-        )
-        # Set runtime environment variables
+        # Layer 6: Install environments from Prime Intellect hub
+        .run_commands("prime env install primeintellect/single-turn-math --with uv")
+        # Layer 7: Set runtime environment variables
+        # Must be before add_local_* with copy=False (those are runtime mounts, not build steps)
+        # Note: Modal .env() doesn't support shell variable expansion, so we set full paths
         .env({
             "PYTHONUNBUFFERED": "1",
-            "PATH": "/app/.venv/bin:/root/.local/bin:$PATH",
+            "PATH": "/app/.venv/bin:/root/.local/bin:/usr/local/bin:/usr/bin:/bin",
+            "PYTHONPATH": "/app/src",
         })
+        # Layers 8-12: Mount all project files at RUNTIME (not built into image)
+        # Using copy=False means changes deploy instantly without image rebuilds!
+        # These MUST be last since no build steps can follow copy=False
+        .add_local_dir(
+            "configs",
+            remote_path="/app/configs",
+            copy=False,
+        )
+        .add_local_dir(
+            "src/prime_rl",
+            remote_path="/app/src/prime_rl",
+            copy=False,
+        )
+        .add_local_dir(
+            "tests",
+            remote_path="/app/tests",
+            copy=False,
+        )
+        .add_local_dir(
+            "examples",
+            remote_path="/app/examples",
+            copy=False,
+        )
     )
 
 image = build_image()
@@ -110,40 +150,46 @@ TIMEOUT = 7200  # 2 hours default timeout
     timeout=TIMEOUT * 2,  # Longer timeout to handle training runs
     secrets=[wandb_secret],
 )
-def run_command(cmd: str, output_dir: str | None = None, commit_volume: bool = True):
+def run_command(
+    cmd: str,
+    output_dir: str | None = None,
+    commit_volume: bool = True,
+    commit_interval: int = 2400,
+):
     """
     Run any command in the Modal environment.
-    
+
     This is a unified function that handles all commands - RL training, eval, inference, etc.
     It automatically detects RL commands and adds --output-dir if needed.
     GPU usage is controlled by the command itself (e.g., CUDA_VISIBLE_DEVICES).
-    
+
     Examples:
         # RL training
         modal run modal_rl.py::run_command --cmd "uv run rl @ configs/gsm8k/rl.toml --wandb.project gsm8k-modal --wandb.name gsm8k-run --ckpt"
-        
+
         # Evaluation (connects to inference server)
         modal run modal_rl.py::run_command --cmd "uv run vf-eval single-turn-math -a '{\"dataset_name\": \"openai/gsm8k\"}' -m PrimeIntellect/Qwen3-0.6B -b http://localhost:8000/v1 -n 20"
-        
+
         # Inference server (use CUDA_VISIBLE_DEVICES to use only GPU 0)
         modal run modal_rl.py::run_command --cmd "CUDA_VISIBLE_DEVICES=0 uv run inference --model.name PrimeIntellect/Qwen3-0.6B"
-        
+
         # Any Python command
         modal run modal_rl.py::run_command --cmd "uv run python -c 'import torch; print(torch.cuda.device_count())'"
-        
+
         # List outputs
         modal run modal_rl.py::run_command --cmd "ls -lah /data/outputs"
-        
+
         # Read logs
         modal run modal_rl.py::run_command --cmd "tail -n 100 /data/outputs/logs/orchestrator.stdout"
-        
+
         # Stream logs
         modal run modal_rl.py::run_command --cmd "tail -f /data/outputs/logs/trainer.stdout"
-    
+
     Args:
         cmd: The command to run
-        output_dir: Output directory for RL commands (default: /data/outputs). Only used if cmd is an RL command.
+        output_dir: Output directory for RL commands (default: /data/outputs/<timestamp>). Only used if cmd is an RL command.
         commit_volume: Whether to commit volume periodically during execution (default: True). Set False for quick commands.
+        commit_interval: Interval in seconds between volume commits (default: 2400 = 40 minutes).
     """
     import subprocess
     import sys
@@ -153,10 +199,12 @@ def run_command(cmd: str, output_dir: str | None = None, commit_volume: bool = T
     
     # Detect if this is an RL command
     is_rl_command = "uv run rl" in cmd or "rl @" in cmd
-    
+
     # Append output-dir for RL commands if not present
+    # Use timestamp to avoid overwriting previous runs
     if is_rl_command and output_dir is None:
-        output_dir = "/data/outputs"
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        output_dir = f"/data/outputs/{timestamp}"
     
     if is_rl_command and output_dir and "--output-dir" not in cmd:
         cmd = f"{cmd} --output-dir {output_dir}"
@@ -191,8 +239,6 @@ def run_command(cmd: str, output_dir: str | None = None, commit_volume: bool = T
     should_commit = threading.Event()
     
     if commit_volume:
-        commit_interval = 2400  # 40 minutes
-        
         def periodic_commit():
             """Commit volume periodically so data is accessible from other functions."""
             while not should_commit.is_set():
